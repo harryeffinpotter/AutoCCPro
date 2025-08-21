@@ -1,4 +1,5 @@
 import os, sys, json, shutil, re
+import winsound
 import threading
 import tkinter as tk
 from tkinter import messagebox
@@ -14,10 +15,14 @@ def run_bypass_async(button: tk.Button, status_var: tk.StringVar) -> None:
 			status_var.set("Running…")
 			capcut.main()
 			status_var.set("Done. Export in CapCut.")
-			messagebox.showinfo("Bypass Pro", "Finished. Export in CapCut.")
+			try:
+				winsound.MessageBeep(winsound.MB_ICONASTERISK)
+			except Exception:
+				pass
 		except Exception as exc:
 			status_var.set(f"Error: {exc}")
-			messagebox.showerror("Bypass Pro", f"Error: {exc}")
+			# Optional: surface errors without modal popups if desired
+			# messagebox.showerror("Bypass Pro", f"Error: {exc}")
 		finally:
 			button.config(state=tk.NORMAL)
 
