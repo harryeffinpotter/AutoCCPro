@@ -9,12 +9,21 @@ from pathlib import Path
 import capcut
 
 
-def run_bypass_async(button: tk.Button, status_var: tk.StringVar) -> None:
+def run_bypass_async(button: tk.Button, status_var: tk.StringVar, status_label: tk.Label) -> None:
 	def _task():
 		try:
+			# reset status style to normal while running
+			try:
+				status_label.config(fg="#e6edf3", font=("Segoe UI", 10))
+			except Exception:
+				pass
 			status_var.set("Running…")
 			capcut.main()
 			status_var.set("Done. Export in CapCut.")
+			try:
+				status_label.config(fg="#22ff66", font=("Segoe UI", 10, "bold"))
+			except Exception:
+				pass
 			try:
 				winsound.MessageBeep(winsound.MB_ICONASTERISK)
 			except Exception:
@@ -321,7 +330,13 @@ def main():
 		except Exception:
 			pass
 
-	btn_bypass_border, btn_bypass = outlined_button(row, "Bypass Pro", lambda: (capcut.set_status_callback(update_status), run_bypass_async(btn_bypass, status_var)) if ensure_config_before_run() else None)
+	def ask_confirm(msg: str) -> bool:
+		try:
+			return bool(messagebox.askyesno("CapCut Bypass Pro", msg))
+		except Exception:
+			return False
+
+	btn_bypass_border, btn_bypass = outlined_button(row, "Bypass Pro", lambda: (capcut.set_status_callback(update_status), capcut.set_confirm_callback(ask_confirm), run_bypass_async(btn_bypass, status_var, status)) if ensure_config_before_run() else None)
 	btn_bypass_border.pack(side=tk.LEFT)
 
 	status = tk.Label(container, textvariable=status_var, anchor="w", fg=TEXT, bg=DARK_BG)

@@ -9,6 +9,7 @@ CAPCUT_EXE = "capcut.exe"
 # Saved main window handle for reliable refocus between actions
 CAPCUT_MAIN_HANDLE = None
 DASH_STATUS_CB = None
+CONFIRM_CB = None
 
 def set_status_callback(callback):
     """Install a status callback callable(str)."""
@@ -21,6 +22,19 @@ def _status(msg: str):
             DASH_STATUS_CB(msg)
     except Exception:
         pass
+
+def set_confirm_callback(callback):
+    """Install a confirm callback callable(str)->bool."""
+    global CONFIRM_CB
+    CONFIRM_CB = callback
+
+def _confirm(msg: str) -> bool:
+    try:
+        if CONFIRM_CB:
+            return bool(CONFIRM_CB(msg))
+    except Exception:
+        pass
+    return False
 WAIT_WINDOW_S = 30
 SEARCH_TIMEOUT_S = 900
 GRACE_S = 5  # filesystem time cushion
@@ -29,6 +43,19 @@ DRAFT_ROOTS = [
     os.path.expandvars(r"%LOCALAPPDATA%\CapCut\User Data\Projects\com.lveditor.draft"),
     os.path.expandvars(r"%USERPROFILE%\Documents\CapCut\Projects\CapCut Drafts"),
 ]
+
+# Optional extra search dirs (e.g., motion blur cache)
+EXTRA_SEARCH_DIRS = [
+    os.path.expandvars(r"%LOCALAPPDATA%\CapCut\User Data\Cache\MotionBlurCache"),
+]
+_extra_env = os.environ.get("CAPCUT_EXTRA_SEARCH_DIRS", "")
+if _extra_env:
+    for _p in _extra_env.split(";"):
+        if _p.strip():
+            EXTRA_SEARCH_DIRS.append(os.path.expandvars(_p.strip()))
+_mb_env = os.environ.get("CAPCUT_MOTIONBLUR_CACHE", "")
+if _mb_env:
+    EXTRA_SEARCH_DIRS.append(os.path.expandvars(_mb_env))
 
 # -------- window helpers --------
 def focus_capcut_or_fail(timeout=WAIT_WINDOW_S):
@@ -244,7 +271,7 @@ def find_open_file_dialog(timeout: float = 5.0):
     return None
 
 # -------- UI replace clip (no relaunch) --------
-def replace_clip_via_open_dialog(clip_path: Path, shortcut="^l", settle_s: float = 0.4):
+def replace_clip_via_open_dialog(clip_path: Path, shortcut="^l", settle_s: float = 0.05):
     """Assumes the timeline has a clip selected; sends your Replace Clip shortcut (e.g., Ctrl+L),
     then pastes the absolute path into the OS file picker and presses Enter, finally saves.
     """
@@ -255,22 +282,35 @@ def replace_clip_via_open_dialog(clip_path: Path, shortcut="^l", settle_s: float
     time.sleep(0.15)
     _status("Opening Replace dialog…")
     refocus_capcut_if_possible(); send_keys(shortcut)
-    time.sleep(settle_s)
+    # Do not wait long; immediately start polling for the dialog
 
     # Prefer controlling the Open dialog directly to avoid send_keys escaping issues
     abs_path = str(clip_path)
-    dlg = find_open_file_dialog(timeout=4.0)
+    dlg = find_open_file_dialog(timeout=2.0)
     if dlg is not None:
         try:
             # Find filename edit and set text
             edits = dlg.descendants(control_type="Edit")
             if edits:
+                # Focus the dialog and the edit control explicitly
+                try:
+                    dlg.wrapper_object().set_focus()
+                except Exception:
+                    pass
                 ew = edits[0].wrapper_object()
+                try:
+                    ew.set_focus()
+                except Exception:
+                    pass
                 _status("Pasting path…")
                 ew.set_edit_text(abs_path)
             else:
                 # Clipboard paste into focused control
                 _status("Pasting path…")
+                try:
+                    dlg.wrapper_object().set_focus()
+                except Exception:
+                    pass
                 cb.copy(abs_path); send_keys("^v")
             # Click Open/确定
             buttons = [e for e in dlg.descendants(control_type="Button") if (e.window_text() or "").lower() in ("open", "select", "ok", "choose", "insert", "attach")]
@@ -290,10 +330,6 @@ def replace_clip_via_open_dialog(clip_path: Path, shortcut="^l", settle_s: float
             send_keys(abs_path)
         time.sleep(0.1)
         send_keys("{ENTER}")
-
-    # Some dialogs confirm twice
-    time.sleep(0.4)
-    send_keys("{ENTER}")
 
     # Allow media import/replace and save
     time.sleep(1.0)
@@ -323,13 +359,76 @@ def newest_nonalpha_mp4_since_anywhere(pre_ts: float, timeout_s: int = SEARCH_TI
     Search the ENTIRE drafts tree for the newest .mp4 whose mtime >= pre_ts - grace,
     and whose filename does NOT end with 'alpha.mp4'. Returns the Path (may be a _temp.mp4).
     """
-    roots = list_all_draft_roots()
+    normal_roots = list_all_draft_roots()
+    extra_roots: list[Path] = []
+    for extra in EXTRA_SEARCH_DIRS:
+        try:
+            p = Path(extra)
+            if p.exists():
+                extra_roots.append(p)
+        except Exception:
+            pass
+    # by default search both; after Motion Blur confirmation, restrict to extra only
+    restrict_to_extra = False
     deadline = time.time() + timeout_s
     threshold = pre_ts - grace_s
     best_path, best_m = None, -1.0
 
+    warned_stuck = False
+    def _check_temp_progress_or_final(check_duration: float, threshold_ts: float):
+        """Wait check_duration seconds, then decide: (is_progress, final_path_or_None).
+        - If a final non-alpha mp4 appears after waiting, return (False, final_path)
+        - Else if newest temp file grew in size, return (True, None)
+        - Else return (False, None)
+        """
+        try:
+            # pick newest temp
+            newest_temp, newest_m = None, -1.0
+            for root in roots:
+                for p in Path(root).rglob("*_temp.mp4"):
+                    try:
+                        m = p.stat().st_mtime
+                    except OSError:
+                        continue
+                    if m > newest_m:
+                        newest_temp, newest_m = p, m
+            s0 = None
+            if newest_temp is not None:
+                try:
+                    s0 = newest_temp.stat().st_size
+                except OSError:
+                    s0 = None
+            # wait
+            time.sleep(check_duration)
+            # re-scan for a final candidate that appeared meanwhile
+            best_path2, best_m2 = None, -1.0
+            for root in roots:
+                for p in Path(root).rglob("*.mp4"):
+                    name = p.name.lower()
+                    if name.endswith("alpha.mp4"):
+                        continue
+                    try:
+                        m = p.stat().st_mtime
+                    except OSError:
+                        continue
+                    if m >= threshold_ts and m > best_m2:
+                        best_path2, best_m2 = p, m
+            if best_path2 is not None:
+                return (False, best_path2)
+            # otherwise, see if temp grew
+            if newest_temp is not None and s0 is not None:
+                try:
+                    s1 = newest_temp.stat().st_size
+                    if s1 > s0:
+                        return (True, None)
+                except OSError:
+                    pass
+            return (False, None)
+        except Exception:
+            return (False, None)
     while time.time() < deadline:
-        for root in roots:
+        search_roots = (extra_roots if restrict_to_extra else (normal_roots + extra_roots))
+        for root in search_roots:
             for p in root.rglob("*.mp4"):
                 name = p.name.lower()
                 if name.endswith("alpha.mp4"):   # your explicit rule
@@ -341,8 +440,36 @@ def newest_nonalpha_mp4_since_anywhere(pre_ts: float, timeout_s: int = SEARCH_TI
                 if m >= threshold and m > best_m:
                     best_path, best_m = p, m
         if best_path:
-            print(f"[found latest] {best_path} (mtime={best_m:.3f} >= {threshold:.3f})")
+            _status(f"Found processed clip: {best_path}")
             return best_path
+        # After 120s with no output, check for temp activity; only warn if no temp growth is observed
+        if not warned_stuck and (time.time() - pre_ts) > 120:
+            warned_stuck = True
+            # If a normal temp file exists, assume in-progress without prompting
+            try:
+                has_normal_temp = any(True for r in normal_roots for _ in Path(r).rglob("*_temp.mp4"))
+            except Exception:
+                has_normal_temp = False
+            if has_normal_temp:
+                _status("Pre-processing in progress (temp file present)…")
+                time.sleep(1.0)
+                continue
+            in_progress, final_now = _check_temp_progress_or_final(10.0, threshold)
+            if final_now is not None:
+                _status(f"Found processed clip: {final_now}")
+                return final_now
+            if in_progress:
+                _status("Pre-processing in progress (temp file is growing)…")
+            else:
+                _status("Still waiting (>2m) and no temp file growth.")
+                if _confirm(
+                    "We noticed no Pre-processing activity. Does your compound clip show 'Waiting to preprocess'?\n\n"
+                    "This typically means the workflow is corrupted. The best workaround is to select the clip and apply a 1% Motion Blur.\n\n"
+                    "To continue with this solution simply select the clip, then select \"Video\" tab then \"Basic\" tab underneath that, scroll down to Motion blur, enable it, and set it to 1%. It will immediately begin applying the motion blur.\n\n"
+                    "Click Yes once you've applied Motion Blur, and the automation will continue."
+                ):
+                    _status("Motion Blur acknowledged. Monitoring MotionBlurCache for output…")
+                    restrict_to_extra = True
         time.sleep(0.4)
 
     raise TimeoutError("No post-Preprocess .mp4 found under drafts.")
