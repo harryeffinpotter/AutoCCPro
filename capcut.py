@@ -231,10 +231,9 @@ def restart_capcut_and_focus():
 
 # -------- timeline ops --------
 def compound_and_save():
-    _status("Uncompounding any compounded clips…")
+    _status("Compounding all clips…")
     # Select everything
     refocus_capcut_if_possible(); send_keys("^a"); time.sleep(0.2)
-    _status("Compounding all clips…")
     # Compound all into one: Alt+G
     refocus_capcut_if_possible(); send_keys("%g"); time.sleep(0.2)
     # Save
@@ -382,9 +381,10 @@ def newest_nonalpha_mp4_since_anywhere(pre_ts: float, timeout_s: int = SEARCH_TI
         - Else return (False, None)
         """
         try:
+            scan_roots = (extra_roots if restrict_to_extra else (normal_roots + extra_roots))
             # pick newest temp
             newest_temp, newest_m = None, -1.0
-            for root in roots:
+            for root in scan_roots:
                 for p in Path(root).rglob("*_temp.mp4"):
                     try:
                         m = p.stat().st_mtime
@@ -402,7 +402,7 @@ def newest_nonalpha_mp4_since_anywhere(pre_ts: float, timeout_s: int = SEARCH_TI
             time.sleep(check_duration)
             # re-scan for a final candidate that appeared meanwhile
             best_path2, best_m2 = None, -1.0
-            for root in roots:
+            for root in scan_roots:
                 for p in Path(root).rglob("*.mp4"):
                     name = p.name.lower()
                     if name.endswith("alpha.mp4"):
