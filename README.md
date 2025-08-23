@@ -5,10 +5,12 @@ CapCut Bypass Pro automates a reliable “one‑click” flow to replace a clip 
 ## What it does
 
 - Focuses CapCut and saves your project
-- Un‑compounds any previously compounded segments, then compounds all into a single clip
+- Compounds all segments into a single clip
 - Triggers your Pre‑process action
 - Finds the newest non‑alpha mp4 in your CapCut drafts and replaces the clip via the file dialog
 - Saves again and gives you a status update (with a chime) – no popups
+
+This process tricks CapCut into thinking no Pro features have been applied to the video.
 
 ## Requirements (shortcuts)
 
