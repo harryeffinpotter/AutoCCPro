@@ -3,6 +3,8 @@ from pathlib import Path
 from pywinauto import Desktop, Application, mouse
 import pyperclip as cb
 from pywinauto.keyboard import send_keys
+import win32gui
+import win32process
 
 # -------- config --------
 CAPCUT_EXE = "capcut.exe"
@@ -35,7 +37,7 @@ def _confirm(msg: str) -> bool:
     except Exception:
         pass
     return False
-WAIT_WINDOW_S = 30
+WAIT_WINDOW_S = 5  # Window detection timeout
 SEARCH_TIMEOUT_S = 900
 GRACE_S = 5  # filesystem time cushion
 
@@ -60,55 +62,96 @@ if _mb_env:
 # -------- window helpers --------
 def focus_capcut_or_fail(timeout=WAIT_WINDOW_S):
     t0 = time.time()
-    while time.time() - t0 < timeout:
-        wins = []
-        for w in Desktop(backend="uia").windows(visible_only=True, top_level_only=True):
-            try:
-                if psutil.Process(w.element_info.process_id).name().lower() == CAPCUT_EXE:
-                    wins.append(w)
-            except Exception:
-                pass
-        if wins:
-            # Heuristic: prefer the actual editor window over the Home/Projects hub
-            def score(window):
-                try:
-                    spec = Desktop(backend="uia").window(handle=window.handle)
-                    # Cheap checks first
-                    r = window.rectangle()
-                    s = (r.width() * r.height()) / 1_000_000.0  # size factor
-                    txts = []
-                    try:
-                        txts = [e.window_text().lower() for e in spec.descendants(control_type="Text")[:200]]
-                    except Exception:
-                        pass
-                    # Signals of Home
-                    is_home = any(k in txts for k in [
-                        "create project", "projects", "ai video maker", "script to video"
-                    ])
-                    # Signals of Editor
-                    is_editor = any(k in txts for k in [
-                        "timeline", "export", "media", "canvas", "track", "preview"
-                    ])
-                    base = 0.0
-                    if is_editor:
-                        base += 10.0
-                    if is_home:
-                        base -= 5.0
-                    return base + s
-                except Exception:
-                    return 0
 
-            best = max(wins, key=score)
-            Application(backend="uia").connect(process=best.element_info.process_id)
-            spec = Desktop(backend="uia").window(handle=best.handle)  # WindowSpecification
-            spec.wait("visible ready", timeout=5)
+    # Find CapCut process FIRST using psutil (super fast)
+    capcut_processes = []
+    for p in psutil.process_iter(attrs=["name", "pid", "memory_info"]):
+        try:
+            if p.info.get("name", "").lower() == CAPCUT_EXE:
+                mem = p.info.get("memory_info").rss if p.info.get("memory_info") else 0
+                capcut_processes.append((p.info["pid"], mem))
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    if not capcut_processes:
+        raise RuntimeError("CapCut.exe not running. Open CapCut first.")
+
+    # Sort by memory usage (highest first) and pick the top one
+    capcut_processes.sort(key=lambda x: x[1], reverse=True)
+    main_pid = capcut_processes[0][0]
+    capcut_pids = [main_pid]
+
+    # Use win32gui to enumerate windows (MUCH faster than UIA)
+    def enum_windows_callback(hwnd, results):
+        if not win32gui.IsWindowVisible(hwnd):
+            return
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            if pid in capcut_pids:
+                title = win32gui.GetWindowText(hwnd)
+                title_lower = title.lower()
+
+                # Must have "capcut" in title, but NOT "bypass"
+                if "bypass" in title_lower:
+                    return
+
+                if "capcut" in title_lower:
+                    results.append(hwnd)
+        except Exception:
+            pass
+
+    hwnds = []
+    win32gui.EnumWindows(enum_windows_callback, hwnds)
+
+    # Remove duplicates
+    hwnds = list(set(hwnds))
+
+    # Convert HWNDs to pywinauto window objects
+    wins = []
+    for hwnd in hwnds:
+        try:
+            spec = Desktop(backend="uia").window(handle=hwnd)
+            wins.append(spec.wrapper_object())
+        except Exception:
+            pass
+
+    if wins:
+        # Pick the biggest window
+        def get_size(window):
+            try:
+                r = window.rectangle()
+                return r.width() * r.height()
+            except Exception:
+                return 0
+
+        best = max(wins, key=get_size)
+
+        try:
+            spec = Desktop(backend="uia").window(handle=best.handle)
+            spec.wait("visible ready", timeout=2)
             wrapper = spec.wrapper_object()
             wrapper.set_focus()
+            time.sleep(0.5)  # Give window time to actually accept focus
+
             # remember main window handle
             global CAPCUT_MAIN_HANDLE
             CAPCUT_MAIN_HANDLE = best.handle
             return wrapper
-        time.sleep(0.2)
+        except Exception:
+            # If we fail to focus this window, try the next biggest
+            if len(wins) > 1:
+                for alt_win in sorted(wins, key=get_size, reverse=True)[1:]:
+                    try:
+                        spec = Desktop(backend="uia").window(handle=alt_win.handle)
+                        spec.wait("visible ready", timeout=2)
+                        wrapper = spec.wrapper_object()
+                        wrapper.set_focus()
+                        time.sleep(0.5)
+                        CAPCUT_MAIN_HANDLE = alt_win.handle
+                        return wrapper
+                    except Exception:
+                        continue
+
     raise RuntimeError("CapCut.exe window not found. Open your project first.")
 
 def refocus_capcut_if_possible() -> bool:
@@ -233,11 +276,11 @@ def restart_capcut_and_focus():
 def compound_and_save():
     _status("Compounding all clips…")
     # Select everything
-    refocus_capcut_if_possible(); send_keys("^a"); time.sleep(0.2)
+    refocus_capcut_if_possible(); send_keys("^a"); time.sleep(0.5)
     # Compound all into one: Alt+G
-    refocus_capcut_if_possible(); send_keys("%g"); time.sleep(0.2)
+    refocus_capcut_if_possible(); send_keys("%g"); time.sleep(1.0)
     # Save
-    refocus_capcut_if_possible(); send_keys("^s"); time.sleep(0.2)
+    refocus_capcut_if_possible(); send_keys("^s"); time.sleep(0.5)
 
 def trigger_preprocess_shortcut_and_mark():
     _status("PRE-PROCESSING – PLEASE WAIT…")
@@ -269,6 +312,47 @@ def find_open_file_dialog(timeout: float = 5.0):
         time.sleep(0.15)
     return None
 
+def find_filename_edit_in_dialog(dialog_spec):
+    """Find the filename input box in a file dialog.
+    Returns the Edit control most likely to be the filename field."""
+    try:
+        edits = dialog_spec.descendants(control_type="Edit")
+        if not edits:
+            return None
+
+        # Strategy 1: Look for an Edit with automation_id or name suggesting filename
+        filename_hints = ["filename", "file name", "1148", "1001"]  # common IDs
+        for edit in edits:
+            try:
+                auto_id = getattr(edit, "automation_id", lambda: "")()
+                name = getattr(edit, "window_text", lambda: "")()
+                if any(hint in auto_id.lower() for hint in filename_hints):
+                    return edit
+                if any(hint in name.lower() for hint in filename_hints):
+                    return edit
+            except Exception:
+                continue
+
+        # Strategy 2: Return the bottom-most single-line Edit (filename box is usually at bottom)
+        single_line_edits = []
+        for edit in edits:
+            try:
+                rect = edit.rectangle()
+                # Single-line edits are typically wider than tall
+                if rect.width() > rect.height() * 2:
+                    single_line_edits.append(edit)
+            except Exception:
+                continue
+
+        if single_line_edits:
+            # Return the one with the highest Y coordinate (bottom-most)
+            return max(single_line_edits, key=lambda e: e.rectangle().bottom)
+
+        # Strategy 3: Just return the last Edit (often the filename box)
+        return edits[-1] if edits else None
+    except Exception:
+        return None
+
 # -------- UI replace clip (no relaunch) --------
 def replace_clip_via_open_dialog(clip_path: Path, shortcut="^l", settle_s: float = 0.05):
     """Assumes the timeline has a clip selected; sends your Replace Clip shortcut (e.g., Ctrl+L),
@@ -281,53 +365,140 @@ def replace_clip_via_open_dialog(clip_path: Path, shortcut="^l", settle_s: float
     time.sleep(0.15)
     _status("Opening Replace dialog…")
     refocus_capcut_if_possible(); send_keys(shortcut)
-    # Do not wait long; immediately start polling for the dialog
+
+    # Wait a bit longer for the dialog to fully appear
+    time.sleep(0.3)
 
     # Prefer controlling the Open dialog directly to avoid send_keys escaping issues
     abs_path = str(clip_path)
-    dlg = find_open_file_dialog(timeout=2.0)
+    time.sleep(0.5)  # Give dialog time to fully open
+
+    # Just use keyboard shortcuts - WAY more reliable
+    send_keys("%n")  # Alt+N jumps to "File name:" field
+    time.sleep(0.15)
+    send_keys("^a")  # Select all
+    time.sleep(0.1)
+    cb.copy(abs_path)
+    send_keys("^v")  # Paste
+    time.sleep(0.2)
+    send_keys("{ENTER}")  # Open file dialog
+    time.sleep(0.8)  # Wait for replace confirmation dialog
+    send_keys("{ENTER}")  # Confirm "Replace Clip"
+    time.sleep(0.8)  # Wait for replacement to complete
+    _status("Saving…")
+    send_keys("^s")
+    return
+
+    # OLD CODE BELOW (kept as fallback)
+    dlg = find_open_file_dialog(timeout=3.0)
     if dlg is not None:
+        _status("Pasting path…")
+        success = False
+
         try:
-            # Find filename edit and set text
-            edits = dlg.descendants(control_type="Edit")
-            if edits:
-                # Focus the dialog and the edit control explicitly
+            # Strategy 1: Find the correct filename Edit control using our smart helper
+            filename_edit = find_filename_edit_in_dialog(dlg)
+
+            if filename_edit:
                 try:
+                    # Focus dialog first
                     dlg.wrapper_object().set_focus()
-                except Exception:
+                    time.sleep(0.1)
+
+                    # Get the wrapper and try multiple focus methods
+                    ew = filename_edit.wrapper_object()
+
+                    # Method 1: Direct focus
+                    try:
+                        ew.set_focus()
+                        time.sleep(0.05)
+                    except Exception:
+                        pass
+
+                    # Method 2: Click on the control to ensure it's focused
+                    try:
+                        ew.click_input()
+                        time.sleep(0.05)
+                    except Exception:
+                        pass
+
+                    # Method 3: Select all existing text first (ensures focus)
+                    try:
+                        send_keys("^a")
+                        time.sleep(0.05)
+                    except Exception:
+                        pass
+
+                    # Now try to set the text directly
+                    try:
+                        ew.set_edit_text(abs_path)
+                        success = True
+                    except Exception:
+                        # If set_edit_text fails, use clipboard paste
+                        cb.copy(abs_path)
+                        send_keys("^v")
+                        success = True
+
+                except Exception as e:
+                    # Log but continue to fallbacks
                     pass
-                ew = edits[0].wrapper_object()
-                try:
-                    ew.set_focus()
-                except Exception:
-                    pass
-                _status("Pasting path…")
-                ew.set_edit_text(abs_path)
-            else:
-                # Clipboard paste into focused control
-                _status("Pasting path…")
-                try:
-                    dlg.wrapper_object().set_focus()
-                except Exception:
-                    pass
-                cb.copy(abs_path); send_keys("^v")
-            # Click Open/确定
-            buttons = [e for e in dlg.descendants(control_type="Button") if (e.window_text() or "").lower() in ("open", "select", "ok", "choose", "insert", "attach")]
+        except Exception:
+            pass
+
+        # Strategy 2: Keyboard navigation fallback
+        if not success:
+            try:
+                # Focus the dialog
+                dlg.wrapper_object().set_focus()
+                time.sleep(0.1)
+
+                # Use Ctrl+L or Alt+N to jump to filename field (common shortcuts)
+                # Try Alt+N first (File name field accelerator key in many dialogs)
+                send_keys("%n")
+                time.sleep(0.1)
+
+                # Clear any existing text and paste
+                send_keys("^a")
+                cb.copy(abs_path)
+                send_keys("^v")
+                success = True
+            except Exception:
+                pass
+
+        # Strategy 3: Ultimate fallback - just paste wherever focus is
+        if not success:
+            try:
+                dlg.wrapper_object().set_focus()
+                cb.copy(abs_path)
+                send_keys("^v")
+            except Exception:
+                pass
+
+        # Click Open button or press Enter
+        time.sleep(0.2)
+        try:
+            buttons = [e for e in dlg.descendants(control_type="Button")
+                      if (e.window_text() or "").lower() in ("open", "select", "ok", "choose", "insert", "attach")]
             if buttons:
                 buttons[0].wrapper_object().click_input()
             else:
                 send_keys("{ENTER}")
         except Exception:
-            cb.copy(abs_path); send_keys("^v"); time.sleep(0.1); send_keys("{ENTER}")
+            send_keys("{ENTER}")
     else:
-        # Fallback: clipboard paste into current focus
+        # Fallback: dialog not found, try blind paste
+        _status("Pasting path (fallback mode)…")
         try:
-            _status("Pasting path…")
-            cb.copy(abs_path); send_keys("^v")
+            # Try Alt+N to jump to filename field
+            send_keys("%n")
+            time.sleep(0.1)
+            send_keys("^a")
+            cb.copy(abs_path)
+            send_keys("^v")
         except Exception:
-            # Last resort: type (may mangle special chars)
-            send_keys(abs_path)
-        time.sleep(0.1)
+            cb.copy(abs_path)
+            send_keys("^v")
+        time.sleep(0.2)
         send_keys("{ENTER}")
 
     # Allow media import/replace and save

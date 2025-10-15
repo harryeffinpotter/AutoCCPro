@@ -8,10 +8,20 @@ from pathlib import Path
 # Reuse your existing logic
 import capcut
 
+# Global debug log
+DEBUG_LOG = []
+
+def debug(msg):
+	print(f"[DEBUG] {msg}")
+	DEBUG_LOG.append(msg)
+	if len(DEBUG_LOG) > 100:
+		DEBUG_LOG.pop(0)
 
 def run_bypass_async(button: tk.Button, status_var: tk.StringVar, status_label: tk.Label) -> None:
+	debug("run_bypass_async called")
 	def _task():
 		try:
+			debug("bypass thread starting")
 			# reset status style to normal while running
 			try:
 				status_label.config(fg="#e6edf3", font=("Segoe UI", 10))
@@ -28,19 +38,23 @@ def run_bypass_async(button: tk.Button, status_var: tk.StringVar, status_label: 
 				winsound.MessageBeep(winsound.MB_ICONASTERISK)
 			except Exception:
 				pass
+			debug("bypass thread completed successfully")
 		except Exception as exc:
+			debug(f"bypass thread exception: {exc}")
+			import traceback
+			traceback.print_exc()
 			status_var.set(f"Error: {exc}")
-			# Optional: surface errors without modal popups if desired
-			# messagebox.showerror("Bypass Pro", f"Error: {exc}")
 		finally:
 			button.config(state=tk.NORMAL)
 
 	# disable button and run in background
 	button.config(state=tk.DISABLED)
+	debug("Starting bypass thread")
 	threading.Thread(target=_task, daemon=True).start()
 
 
 def main():
+	debug("main() called")
 	# Colors
 	DARK_BG = "#0f1116"
 	DARK_2 = "#161b22"
@@ -61,6 +75,10 @@ def main():
 	shortcut_dir = Path(os.path.expandvars(r"%LOCALAPPDATA%\CapCut\User Data\Config\Shortcut"))
 	combined_src = app_dir / "combined.json"
 	combined_dst = shortcut_dir / "combined.json"
+
+	debug(f"app_dir: {app_dir}")
+	debug(f"state_file: {state_file}")
+	debug(f"shortcut_dir: {shortcut_dir}")
 
 	# Required shortcuts to enforce across all files
 	required_shortcuts = {
@@ -94,7 +112,9 @@ def main():
 	def patch_shortcuts_in_folder(folder: Path) -> int:
 		total = 0
 		if not folder.exists():
+			debug(f"shortcut folder doesn't exist: {folder}")
 			return 0
+		debug(f"patching shortcuts in: {folder}")
 		for fp in folder.glob("*.json"):
 			raw = None
 			try:
@@ -110,6 +130,7 @@ def main():
 					fp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 					did_write = True
 					total += changed
+					debug(f"patched {fp.name}: {changed} changes")
 				# If JSON patch found nothing, try regex on raw text to be robust to non-strict JSON
 				if not did_write:
 					patterns = {
@@ -137,7 +158,9 @@ def main():
 							pass
 						fp.write_text(new_text, encoding="utf-8")
 						total += file_changes
-			except Exception:
+						debug(f"regex-patched {fp.name}: {file_changes} changes")
+			except Exception as e:
+				debug(f"failed to patch {fp}: {e}")
 				# If even reading failed, skip file
 				continue
 		return total
@@ -151,15 +174,19 @@ def main():
 	def write_state(data: dict) -> None:
 		try:
 			state_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-		except Exception:
-			pass
+			debug(f"wrote state: {data}")
+		except Exception as e:
+			debug(f"failed to write state: {e}")
 
 	def is_config_installed() -> bool:
 		# Only rely on our own state flag so first run always prompts
 		st = read_state()
-		return bool(st.get("config_installed"))
+		result = bool(st.get("config_installed"))
+		debug(f"is_config_installed: {result} (state={st})")
+		return result
 
 	def show_install_warning(title_prefix: str = "Install") -> bool:
+		debug(f"show_install_warning called with title_prefix='{title_prefix}'")
 		msg = (
 			"Warning: Clicking Yes will automatically edit your CapCut shortcuts to make the bypass work.\n\n"
 			"If you have custom keybinds you want to keep, set the following manually instead:\n\n"
@@ -172,9 +199,18 @@ def main():
 			f"The installer will patch all *.json in: {shortcut_dir}\n\n"
 			"Note: This will auto-save your project, close CapCut, apply changes, then relaunch CapCut."
 		)
-		return messagebox.askyesno(f"{title_prefix}: CapCut Shortcut Config", msg)
+		try:
+			result = messagebox.askyesno(f"{title_prefix}: CapCut Shortcut Config", msg)
+			debug(f"show_install_warning returned: {result}")
+			return result
+		except Exception as e:
+			debug(f"show_install_warning exception: {e}")
+			import traceback
+			traceback.print_exc()
+			return False
 
 	def install_config() -> bool:
+		debug("install_config called")
 		try:
 			# 1) Save and close CapCut if running
 			try:
@@ -182,17 +218,21 @@ def main():
 				from pywinauto.keyboard import send_keys as _send_keys
 				# Try to save via UI if a window is present
 				try:
+					debug("trying to focus CapCut")
 					capcut.focus_capcut_or_fail(0.5)
+					debug("sending Ctrl+S")
 					_send_keys("^s")
 					import time as _time
 					_time.sleep(0.2)
-				except Exception:
-					pass
+				except Exception as e:
+					debug(f"failed to save CapCut: {e}")
 				# Then terminate existing processes
+				debug("terminating CapCut processes")
 				for p in psutil.process_iter(attrs=["name", "exe"]):
 					try:
 						if (p.info.get("name", "") or "").lower() == "capcut.exe":
 							p.terminate()
+							debug(f"terminated PID {p.pid}")
 					except Exception:
 						pass
 				# Wait for shutdown up to ~8s
@@ -202,25 +242,32 @@ def main():
 					if not any((q.info.get("name", "") or "").lower() == "capcut.exe" for q in psutil.process_iter(attrs=["name"])):
 						break
 					_time.sleep(0.2)
-			except Exception:
-				pass
+				debug("CapCut closed")
+			except Exception as e:
+				debug(f"exception during CapCut close: {e}")
 
 			# 2) Apply shortcut patches
 			shortcut_dir.mkdir(parents=True, exist_ok=True)
+			debug("patching shortcuts...")
 			changes = patch_shortcuts_in_folder(shortcut_dir)
+			debug(f"total changes: {changes}")
 			# If no files were present, optionally fall back to copying provided combined.json
 			if changes == 0:
 				if combined_src.exists():
+					debug(f"copying {combined_src} to {combined_dst}")
 					shutil.copy2(combined_src, combined_dst)
 					changes = 1
 				else:
+					debug("no shortcuts found, showing info")
 					messagebox.showinfo(
 						"Install",
 						"No existing CapCut shortcut JSONs were found to patch. Open CapCut once to generate them, then rerun Install."
 					)
+					return False
 			st = read_state(); st["config_installed"] = True; write_state(st)
 			messagebox.showinfo("Install", f"Shortcut config updated. Changes applied: {changes}\nRelaunching CapCut to load new shortcuts…")
 			# 3) Relaunch CapCut detached (resolve actual exe path if possible)
+			debug("relaunching CapCut")
 			try:
 				import subprocess, psutil
 				# Try to find a previous exe path from processes (if any still listed)
@@ -245,45 +292,67 @@ def main():
 				for path in candidates:
 					if path and os.path.exists(path):
 						try:
+							debug(f"launching: {path}")
 							os.startfile(path)
 							break
-						except Exception:
+						except Exception as e:
+							debug(f"failed to launch {path}: {e}")
 							continue
 				else:
 					# Last resort: rely on PATH
 					try:
+						debug("launching CapCut from PATH")
 						os.startfile("CapCut")
-					except Exception:
+					except Exception as e:
+						debug(f"startfile failed: {e}")
 						subprocess.Popen(["cmd", "/c", "start", "", "CapCut"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-			except Exception:
-				pass
+			except Exception as e:
+				debug(f"exception during relaunch: {e}")
+			debug("install_config completed successfully")
 			return True
 		except Exception as e:
+			debug(f"install_config exception: {e}")
+			import traceback
+			traceback.print_exc()
 			messagebox.showerror("Install", f"Failed to install config: {e}")
 			return False
 
 	def run_install_config_async(button: tk.Button):
 		"""Run install_config in a background thread to avoid freezing the GUI."""
+		debug("run_install_config_async called")
 		def _task():
 			try:
+				debug("install_config thread starting")
 				install_config()
+				debug("install_config thread completed")
+			except Exception as e:
+				debug(f"install_config thread exception: {e}")
+				import traceback
+				traceback.print_exc()
 			finally:
 				button.config(state=tk.NORMAL)
+				debug("button re-enabled")
 		button.config(state=tk.DISABLED)
+		debug("button disabled, starting thread")
 		threading.Thread(target=_task, daemon=True).start()
 
 	def ensure_config_before_run() -> bool:
+		debug("ensure_config_before_run called")
 		if is_config_installed():
+			debug("config is installed, proceeding")
 			return True
+		debug("config not installed, showing warning")
 		if show_install_warning("First run"):
+			debug("user clicked Yes, installing config synchronously")
 			return install_config()
+		debug("user clicked No")
 		messagebox.showwarning("Config Required", "Please click 'Install Config' and try again.")
 		return False
 
 	root = tk.Tk()
-	root.title("CapCut Bypass Pro")
-	root.geometry("520x220")
-	root.minsize(500, 200)
+	root.title("CapCut Bypass Pro [DEBUG]")
+	root.geometry("520x280")
+	root.minsize(500, 260)
 	# Standard window chrome gives minimize and close
 	root.configure(bg=DARK_BG)
 
@@ -302,6 +371,7 @@ def main():
 	container.pack(fill=tk.BOTH, expand=True)
 
 	status_var = tk.StringVar(value="Ready.")
+	debug_var = tk.StringVar(value="")
 
 	def outlined_button(parent: tk.Widget, text: str, command):
 		border = tk.Frame(parent, bg=ACCENT, bd=0)
@@ -326,13 +396,26 @@ def main():
 		inner.bind("<Leave>", lambda e: _hover(e, False))
 		return border, inner
 
-	title = tk.Label(container, text="CapCut Bypass Pro", fg=TEXT, bg=DARK_BG, font=("Segoe UI", 12, "bold"))
+	title = tk.Label(container, text="CapCut Bypass Pro [DEBUG]", fg=TEXT, bg=DARK_BG, font=("Segoe UI", 12, "bold"))
 	title.pack(anchor="w", pady=(0, 8))
 
 	row = tk.Frame(container, bg=DARK_BG)
 	row.pack(fill=tk.X)
 
-	btn_install_border, btn_install = outlined_button(row, "Install Config", lambda: run_install_config_async(btn_install) if show_install_warning("Install") else None)
+	def on_install_click():
+		debug("Install Config button clicked")
+		try:
+			if show_install_warning("Install"):
+				debug("User clicked Yes, running install_config_async")
+				run_install_config_async(btn_install)
+			else:
+				debug("User clicked No or dialog was cancelled")
+		except Exception as e:
+			debug(f"on_install_click exception: {e}")
+			import traceback
+			traceback.print_exc()
+
+	btn_install_border, btn_install = outlined_button(row, "Install Config", on_install_click)
 	btn_install_border.pack(side=tk.LEFT, padx=(0, 12))
 
 	def update_status(msg: str):
@@ -347,20 +430,46 @@ def main():
 		except Exception:
 			return False
 
-	btn_bypass_border, btn_bypass = outlined_button(row, "Bypass Pro", lambda: (capcut.set_status_callback(update_status), capcut.set_confirm_callback(ask_confirm), run_bypass_async(btn_bypass, status_var, status)) if ensure_config_before_run() else None)
+	def on_bypass_click():
+		debug("Bypass Pro button clicked")
+		try:
+			if ensure_config_before_run():
+				debug("Config check passed, setting callbacks and running")
+				capcut.set_status_callback(update_status)
+				capcut.set_confirm_callback(ask_confirm)
+				run_bypass_async(btn_bypass, status_var, status)
+			else:
+				debug("Config check failed, not running")
+		except Exception as e:
+			debug(f"on_bypass_click exception: {e}")
+			import traceback
+			traceback.print_exc()
+
+	btn_bypass_border, btn_bypass = outlined_button(row, "Bypass Pro", on_bypass_click)
 	btn_bypass_border.pack(side=tk.LEFT)
 
 	status = tk.Label(container, textvariable=status_var, anchor="w", fg=TEXT, bg=DARK_BG)
 	status.pack(fill=tk.X, pady=(12, 0))
 
+	# Debug output
+	debug_label = tk.Label(container, textvariable=debug_var, anchor="w", fg="#888", bg=DARK_BG, font=("Consolas", 8), justify=tk.LEFT)
+	debug_label.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+
+	def update_debug_display():
+		if DEBUG_LOG:
+			debug_var.set("\n".join(DEBUG_LOG[-5:]))
+		root.after(100, update_debug_display)
+
+	update_debug_display()
+
 	# subtle border frame
 	border = tk.Frame(container, bg=DARK_2, height=1)
 	border.pack(fill=tk.X, pady=(8, 0))
 
+	debug("GUI initialized")
 	root.mainloop()
 
 
 if __name__ == "__main__":
+	debug("Script started")
 	main()
-
-
