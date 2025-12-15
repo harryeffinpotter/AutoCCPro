@@ -34,7 +34,20 @@ If you prefer manual setup, make sure you set the same bindings in CapCut.
 
 ## Build a standalone EXE
 
-From a Python environment with deps:
+**Requirements:**
+- Python 3.12.x (Python 3.13+ not supported by Nuitka with MinGW64 yet)
+- Nuitka compiler (recommended for fewer antivirus false positives)
+
+**Using Nuitka (recommended):**
+
+```bash
+pip install nuitka ordered-set zstandard psutil pywinauto pyperclip
+python -m nuitka --onefile --windows-console-mode=disable --enable-plugin=tk-inter --windows-icon-from-ico=icon.ico --company-name="YouStayGold" --product-name="Auto Capcut Pro Bypass" --file-version=2.0.0.0 --product-version=2.0.0.0 --file-description="Auto Capcut Pro Bypass" app_gui.py
+```
+
+Output: `app_gui.dist/app_gui.exe`
+
+**Using PyInstaller (alternative, may trigger antivirus):**
 
 ```bash
 pip install -U pyinstaller psutil pywinauto pyperclip

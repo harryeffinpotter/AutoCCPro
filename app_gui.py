@@ -9,8 +9,10 @@ from pathlib import Path
 import capcut
 
 
-def run_bypass_async(button: tk.Button, status_var: tk.StringVar, status_label: tk.Label) -> None:
+def run_bypass_async(button: tk.Button, status_var: tk.StringVar, status_label: tk.Label,
+                      do_backup: bool = False, on_complete = None) -> None:
 	def _task():
+		backup_paths = None
 		try:
 			# reset status style to normal while running
 			try:
@@ -18,7 +20,7 @@ def run_bypass_async(button: tk.Button, status_var: tk.StringVar, status_label: 
 			except Exception:
 				pass
 			status_var.set("Running…")
-			capcut.main()
+			backup_paths = capcut.main(do_backup=do_backup)
 			status_var.set("Done. Export in CapCut.")
 			try:
 				status_label.config(fg="#22ff66", font=("Segoe UI", 10, "bold"))
@@ -28,6 +30,8 @@ def run_bypass_async(button: tk.Button, status_var: tk.StringVar, status_label: 
 				winsound.MessageBeep(winsound.MB_ICONASTERISK)
 			except Exception:
 				pass
+			if on_complete:
+				on_complete(backup_paths)
 		except Exception as exc:
 			status_var.set(f"Error: {exc}")
 			# Optional: surface errors without modal popups if desired
@@ -50,8 +54,13 @@ def main():
 
 	# Paths and state
 	def get_app_dir() -> Path:
-		if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-			return Path(sys._MEIPASS)  # type: ignore[attr-defined]
+		# Handle both PyInstaller and Nuitka frozen executables
+		if getattr(sys, "frozen", False):
+			if hasattr(sys, "_MEIPASS"):
+				# PyInstaller
+				return Path(sys._MEIPASS)  # type: ignore[attr-defined]
+			# Nuitka sets __file__ to the extracted .py location
+		# For both Nuitka frozen and non-frozen, use __file__
 		return Path(__file__).resolve().parent
 
 	app_dir = get_app_dir()
@@ -66,7 +75,7 @@ def main():
 	required_shortcuts = {
 		"replaceFragment": ["Ctrl+L"],
 		"selectAll": ["Ctrl+A"],
-		"precompileCombination": ["Ctrl+P"],
+		"precompileCombination": ["Ctrl+Shift+F11"],
 		"segmentCombination": ["Alt+G"],
 	}
 
@@ -121,7 +130,7 @@ def main():
 					replacements = {
 						"replaceFragment": '["Ctrl+L"]',
 						"selectAll": '["Ctrl+A"]',
-						"precompileCombination": '["Ctrl+P"]',
+						"precompileCombination": '["Ctrl+Shift+F11"]',
 						"segmentCombination": '["Alt+G"]',
 					}
 					new_text = raw
@@ -165,7 +174,7 @@ def main():
 			"If you have custom keybinds you want to keep, set the following manually instead:\n\n"
 			"Required custom hotkeys:\n"
 			"  Ctrl+L = Replace Clip\n"
-			"  Ctrl+P = Preprocess Clip\n\n"
+			"  Ctrl+Shift+F11 = Preprocess Clip\n\n"
 			"Required default hotkeys:\n"
 			"  Alt+G  = Create Compound Clip\n"
 			"  Ctrl+A = Select All\n\n"
@@ -290,10 +299,16 @@ def main():
 	# Set window/taskbar icon from bundled icon.ico (works for frozen and non-frozen)
 	try:
 		icon_path = app_dir / "icon.ico"
+		print(f"Looking for icon at: {icon_path}", flush=True)
+		print(f"Icon exists: {icon_path.exists()}", flush=True)
+		print(f"App dir contents: {list(app_dir.iterdir())[:10]}", flush=True)
 		if icon_path.exists():
 			root.iconbitmap(default=str(icon_path))
-	except Exception:
-		pass
+			print("Icon loaded successfully", flush=True)
+		else:
+			print("Icon file not found!", flush=True)
+	except Exception as e:
+		print(f"Icon error: {e}", flush=True)
 
 	# Base font
 	root.option_add("*Font", ("Segoe UI", 10))
@@ -335,6 +350,9 @@ def main():
 	btn_install_border, btn_install = outlined_button(row, "Install Config", lambda: run_install_config_async(btn_install) if show_install_warning("Install") else None)
 	btn_install_border.pack(side=tk.LEFT, padx=(0, 12))
 
+	# Track backup paths
+	backup_paths_ref = [None]  # Use list to allow modification in nested function
+
 	def update_status(msg: str):
 		try:
 			status_var.set(msg)
@@ -347,8 +365,108 @@ def main():
 		except Exception:
 			return False
 
-	btn_bypass_border, btn_bypass = outlined_button(row, "Bypass Pro", lambda: (capcut.set_status_callback(update_status), capcut.set_confirm_callback(ask_confirm), run_bypass_async(btn_bypass, status_var, status)) if ensure_config_before_run() else None)
+	def on_bypass_complete(backup_paths):
+		"""Called when bypass completes successfully."""
+		backup_paths_ref[0] = backup_paths
+		# Show Restore button if restore is enabled
+		if restore_var.get() and backup_paths:
+			btn_finish_border.pack(side=tk.LEFT, padx=(12, 0))
+			btn_finish.config(state=tk.NORMAL)
+
+	def run_bypass():
+		if not ensure_config_before_run():
+			return
+		capcut.set_status_callback(update_status)
+		capcut.set_confirm_callback(ask_confirm)
+		# Hide Restore button at start
+		btn_finish_border.pack_forget()
+		run_bypass_async(btn_bypass, status_var, status, do_backup=restore_var.get(), on_complete=on_bypass_complete)
+
+	btn_bypass_border, btn_bypass = outlined_button(row, "Bypass Pro", run_bypass)
 	btn_bypass_border.pack(side=tk.LEFT)
+
+	# Checkbox for restore (on its own row below buttons)
+	# Load saved checkbox state
+	saved_state = read_state()
+	restore_var = tk.BooleanVar(value=saved_state.get("restore_enabled", False))
+
+	def on_restore_toggle():
+		"""Save checkbox state when toggled."""
+		st = read_state()
+		st["restore_enabled"] = restore_var.get()
+		write_state(st)
+
+	restore_check = tk.Checkbutton(
+		container,
+		text="Enable backup & restore (click Restore after export)",
+		variable=restore_var,
+		command=on_restore_toggle,
+		bg=DARK_BG,
+		fg=TEXT,
+		selectcolor=DARK_2,
+		activebackground=DARK_BG,
+		activeforeground=TEXT,
+		font=("Segoe UI", 9),
+		relief=tk.FLAT,
+		bd=0,
+		cursor="hand2"
+	)
+	restore_check.pack(anchor="w", pady=(8, 0))
+
+	def run_finish():
+		if backup_paths_ref[0]:
+			try:
+				btn_finish.config(state=tk.DISABLED)
+				capcut.restore_draft_from_backup(backup_paths_ref[0])
+
+				# Relaunch CapCut after restore
+				try:
+					import subprocess, psutil
+					launch_path = None
+					for p in psutil.process_iter(attrs=["name", "exe"]):
+						try:
+							if (p.info.get("name", "") or "").lower() == "capcut.exe" and p.info.get("exe"):
+								launch_path = p.info.get("exe")
+								break
+						except Exception:
+							pass
+
+					candidates = [
+						os.path.expandvars(r"%LOCALAPPDATA%\CapCut\Apps\CapCut.exe"),
+					]
+					if launch_path and os.path.exists(launch_path):
+						candidates.append(launch_path)
+					candidates.extend([
+						os.path.expandvars(r"%LOCALAPPDATA%\Programs\CapCut\CapCut.exe"),
+						os.path.expandvars(r"%PROGRAMFILES%\CapCut\CapCut.exe"),
+						os.path.expandvars(r"%PROGRAMFILES(X86)%\CapCut\CapCut.exe"),
+						os.path.expandvars(r"%LOCALAPPDATA%\CapCut\CapCut.exe"),
+					])
+
+					for path in candidates:
+						if path and os.path.exists(path):
+							try:
+								os.startfile(path)
+								break
+							except Exception:
+								continue
+					else:
+						# Last resort: rely on PATH
+						try:
+							os.startfile("CapCut")
+						except Exception:
+							subprocess.Popen(["cmd", "/c", "start", "", "CapCut"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+				except Exception:
+					pass
+
+				backup_paths_ref[0] = None
+				btn_finish_border.pack_forget()
+			except Exception as e:
+				messagebox.showerror("Restore Failed", f"Failed to restore project: {e}")
+				btn_finish.config(state=tk.NORMAL)
+
+	btn_finish_border, btn_finish = outlined_button(row, "Restore", run_finish)
+	# Don't pack initially - will show after bypass completes if restore is enabled
 
 	status = tk.Label(container, textvariable=status_var, anchor="w", fg=TEXT, bg=DARK_BG)
 	status.pack(fill=tk.X, pady=(12, 0))
@@ -361,6 +479,22 @@ def main():
 
 
 if __name__ == "__main__":
-	main()
+	try:
+		print("Starting app...", flush=True)
+		import sys
+		print(f"Python: {sys.version}", flush=True)
+		print(f"Frozen: {getattr(sys, 'frozen', False)}", flush=True)
+		print(f"Executable: {sys.executable}", flush=True)
+		print("Calling main()...", flush=True)
+		main()
+	except Exception as e:
+		import traceback
+		print("=" * 60, flush=True)
+		print("FATAL ERROR:", flush=True)
+		print("=" * 60, flush=True)
+		traceback.print_exc()
+		print("=" * 60, flush=True)
+		input("Press Enter to exit...")
+		sys.exit(1)
 
 

@@ -282,11 +282,17 @@ def compound_and_save():
     # Save
     refocus_capcut_if_possible(); send_keys("^s"); time.sleep(0.5)
 
-def trigger_preprocess_shortcut_and_mark():
+def trigger_preprocess_shortcut_and_mark(extra_settle_time: float = 0.0):
     _status("PRE-PROCESSING – PLEASE WAIT…")
-    refocus_capcut_if_possible(); send_keys("^p")                      # your Pre-process shortcut
-    time.sleep(0.3)
-    refocus_capcut_if_possible(); send_keys("^s")
+    # Select the compound clip first
+    refocus_capcut_if_possible(); time.sleep(0.5 + extra_settle_time)
+    send_keys("^a"); time.sleep(0.3 + extra_settle_time)
+    # Trigger pre-process
+    refocus_capcut_if_possible(); time.sleep(0.5 + extra_settle_time)
+    send_keys("^+{F11}")                      # Ctrl+Shift+F11 Pre-process shortcut
+    time.sleep(0.3 + extra_settle_time)
+    refocus_capcut_if_possible(); time.sleep(0.3 + extra_settle_time)
+    send_keys("^s")
     return time.time()                   # timestamp AFTER sending the shortcut
 
 # -------- dialog helpers --------
@@ -523,6 +529,93 @@ def pick_active_draft_dir():
     candidates.sort(reverse=True)
     return candidates[0][1]
 
+def backup_active_draft():
+    """Backup all drafts modified within 5 minutes of the most recent. Returns list of (original, backup) tuples."""
+    import shutil
+
+    # Save project first
+    print("[*] Saving project before backup...")
+    refocus_capcut_if_possible()
+    send_keys("^s")
+    time.sleep(1.0)
+
+    # Find ALL drafts across all locations with their modification times
+    all_drafts = []
+    for root in list_all_draft_roots():
+        for d in root.iterdir():
+            dc = d / "draft_content.json"
+            if dc.exists():
+                try:
+                    mtime = dc.stat().st_mtime
+                    all_drafts.append((d, mtime))
+                except Exception:
+                    pass
+
+    if not all_drafts:
+        print("[!] No drafts found")
+        return []
+
+    # Sort by modification time (most recent first)
+    all_drafts.sort(key=lambda x: x[1], reverse=True)
+    most_recent_time = all_drafts[0][1]
+
+    # Backup all drafts within 5 minutes (300 seconds) of the most recent
+    backups = []
+    for draft_dir, mtime in all_drafts:
+        if (most_recent_time - mtime) <= 300:  # Within 5 minutes
+            print(f"[*] Backing up recent draft: {draft_dir.name} (modified {int(most_recent_time - mtime)}s ago)")
+            backup_dir = Path(str(draft_dir) + "-backup")
+
+            # Remove old backup if exists
+            if backup_dir.exists():
+                shutil.rmtree(backup_dir)
+
+            # Copy to backup
+            shutil.copytree(draft_dir, backup_dir)
+            backups.append((draft_dir, backup_dir))
+
+    print(f"[✓] Backed up {len(backups)} draft(s)")
+    return backups
+
+def restore_draft_from_backup(backup_list):
+    """Restore drafts from backup list. Closes CapCut, replaces each backed up draft."""
+    import shutil
+
+    if not backup_list:
+        raise RuntimeError("No backups to restore")
+
+    print("[*] Closing CapCut...")
+    # Close CapCut
+    for p in psutil.process_iter(attrs=["name"]):
+        try:
+            if p.info.get("name", "").lower() == CAPCUT_EXE:
+                p.terminate()
+        except Exception:
+            pass
+
+    # Wait for shutdown
+    t0 = time.time()
+    while time.time() - t0 < 10:
+        if not any((q.info.get("name", "").lower() == CAPCUT_EXE) for q in psutil.process_iter(attrs=["name"])):
+            break
+        time.sleep(0.2)
+
+    # Restore each backup
+    for original, backup in backup_list:
+        if not backup.exists():
+            print(f"[!] Warning: Backup not found: {backup}")
+            continue
+
+        print(f"[*] Deleting working draft: {original}")
+        if original.exists():
+            shutil.rmtree(original)
+
+        print(f"[*] Restoring backup: {backup} -> {original}")
+        shutil.move(str(backup), str(original))
+
+    print(f"[✓] Restored {len(backup_list)} draft(s) successfully!")
+    print("[*] You can now reopen CapCut and continue editing.")
+
 # -------- file search / temp-to-final resolution --------
 def newest_nonalpha_mp4_since_anywhere(pre_ts: float, timeout_s: int = SEARCH_TIMEOUT_S, grace_s: int = GRACE_S) -> Path:
     """
@@ -677,7 +770,19 @@ def resolve_temp_to_final(temp_or_final_path: Path, timeout_s: int = 600) -> Pat
 ## pycapcut fallback removed – UI replace flow is the single source of truth
 
 # -------- main --------
-def main():
+def main(do_backup=False):
+    """
+    Main bypass flow.
+
+    Args:
+        do_backup: If True, backup project before bypass. Returns (original, backup) paths.
+                   If False, returns None.
+    """
+    backup_paths = None
+
+    if do_backup:
+        backup_paths = backup_active_draft()
+
     focus_capcut_or_fail()
     print("[*] CapCut focused.")
 
@@ -687,6 +792,44 @@ def main():
     pre_ts = trigger_preprocess_shortcut_and_mark()
     print("[*] Pre-process triggered. Searching drafts for newest non-alpha .mp4...")
 
+    # Check if temp file appears within 10 seconds, retry if not
+    max_retries = 2
+    for retry in range(max_retries):
+        # Poll for temp file every 0.5s for up to 10 seconds
+        found_temp = False
+        for check_iteration in range(20):  # 20 * 0.5s = 10 seconds
+            time.sleep(0.5)
+            # Quick check for any temp file created after pre_ts in draft roots
+            for root in list_all_draft_roots():
+                try:
+                    for temp_file in root.rglob("*_temp.mp4"):
+                        try:
+                            if temp_file.stat().st_mtime >= pre_ts - 5:  # Within 5s grace period
+                                found_temp = True
+                                break
+                        except Exception:
+                            pass
+                    if found_temp:
+                        break
+                except Exception:
+                    pass
+
+            if found_temp:
+                print(f"[✓] Temp file detected after {(check_iteration + 1) * 0.5}s, pre-process is running")
+                break
+
+        if found_temp:
+            break
+
+        if retry < max_retries - 1:
+            print(f"[!] No temp file after 10s, retrying pre-process (attempt {retry + 2}/{max_retries})...")
+            _status(f"Retrying pre-process (attempt {retry + 2})…")
+            # Retry with extra settle time to let UI fully respond
+            pre_ts = trigger_preprocess_shortcut_and_mark(extra_settle_time=0.5)
+        else:
+            print(f"[!] No temp file after {max_retries} attempts, continuing search anyway...")
+            _status("No temp file detected, waiting for output…")
+
     newest = newest_nonalpha_mp4_since_anywhere(pre_ts)
     print(f"[*] Candidate: {newest}")
 
@@ -695,7 +838,15 @@ def main():
 
     # Replace via UI
     replace_clip_via_open_dialog(final_clip)
-    print("[✓] Clip replaced via UI. Export manually in CapCut.")
+    print("[✓] Clip replaced. Opening export dialog...")
+
+    # Open export dialog
+    time.sleep(0.5)
+    refocus_capcut_if_possible()
+    send_keys("^e")
+    print("[✓] Export dialog opened. Configure settings and export.")
+
+    return backup_paths
 
 if __name__ == "__main__":
     main()
