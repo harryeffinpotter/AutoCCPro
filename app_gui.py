@@ -1,9 +1,50 @@
-import os, sys, json, shutil, re
+import os, sys, json, shutil, re, ctypes
 import winsound
 import threading
 import tkinter as tk
 from tkinter import messagebox
 from pathlib import Path
+
+# -------- Auto-elevation --------
+def is_admin():
+    """Check if running with admin privileges."""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except Exception:
+        return False
+
+def run_as_admin():
+    """Re-launch the current script with admin privileges."""
+    try:
+        if getattr(sys, 'frozen', False):
+            # Running as compiled exe
+            script = sys.executable
+            params = ' '.join(sys.argv[1:])
+        else:
+            # Running as script
+            script = sys.executable
+            params = f'"{sys.argv[0]}"'
+            if len(sys.argv) > 1:
+                params += ' ' + ' '.join(sys.argv[1:])
+
+        # ShellExecute with "runas" verb to trigger UAC prompt
+        ret = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", script, params, None, 1
+        )
+        # If ShellExecute succeeds, ret > 32
+        return ret > 32
+    except Exception:
+        return False
+
+def ensure_admin():
+    """Ensure we're running as admin, re-launch if needed."""
+    if not is_admin():
+        if run_as_admin():
+            sys.exit(0)  # Exit this non-elevated instance
+        else:
+            # User declined UAC or error - continue without elevation
+            # Input blocking won't work but app will still function
+            pass
 
 # Reuse your existing logic
 import capcut
@@ -480,11 +521,14 @@ def main():
 
 if __name__ == "__main__":
 	try:
+		# Auto-elevate to admin for input blocking during automation
+		ensure_admin()
+
 		print("Starting app...", flush=True)
-		import sys
 		print(f"Python: {sys.version}", flush=True)
 		print(f"Frozen: {getattr(sys, 'frozen', False)}", flush=True)
 		print(f"Executable: {sys.executable}", flush=True)
+		print(f"Admin: {is_admin()}", flush=True)
 		print("Calling main()...", flush=True)
 		main()
 	except Exception as e:

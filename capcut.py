@@ -1,10 +1,167 @@
-import os, time, psutil, subprocess
+import os, time, psutil, subprocess, ctypes
 from pathlib import Path
 from pywinauto import Desktop, Application, mouse
 import pyperclip as cb
 from pywinauto.keyboard import send_keys
 import win32gui
 import win32process
+
+# -------- input blocking --------
+import threading
+import atexit
+
+# Global failsafe - ensure input is ALWAYS unblocked on exit
+def _emergency_unblock():
+    try:
+        ctypes.windll.user32.BlockInput(False)
+    except Exception:
+        pass
+atexit.register(_emergency_unblock)
+
+def block_input(block: bool = True) -> bool:
+    """Block/unblock user input (keyboard+mouse). Requires admin or UAC elevation.
+    Returns True if successful, False otherwise."""
+    try:
+        # Properly define the function signature
+        BlockInput = ctypes.windll.user32.BlockInput
+        BlockInput.argtypes = [ctypes.c_bool]
+        BlockInput.restype = ctypes.c_bool
+        result = BlockInput(block)
+        return bool(result)
+    except Exception:
+        return False
+
+class BlockingOverlay:
+    """Transparent overlay window shown during input blocking."""
+    def __init__(self, text="CapCut Bypass Pro - Blocking Input..."):
+        self.root = None
+        self.text = text
+
+    def show(self):
+        import tkinter as tk
+        try:
+            self.root = tk.Tk()
+            self.root.withdraw()  # Hide while setting up
+
+            # Transparent, always-on-top, no decorations
+            self.root.overrideredirect(True)
+            self.root.attributes('-topmost', True)
+            self.root.attributes('-alpha', 0.95)
+            # Transparent color key (magenta = transparent)
+            self.root.configure(bg='#010101')
+            self.root.attributes('-transparentcolor', '#010101')
+
+            # Get screen dimensions
+            screen_w = self.root.winfo_screenwidth()
+            screen_h = self.root.winfo_screenheight()
+
+            # Canvas for outlined text
+            canvas = tk.Canvas(self.root, bg='#010101', highlightthickness=0)
+            canvas.pack(fill=tk.BOTH, expand=True)
+
+            text = self.text
+            font = ("Segoe UI", 22, "bold")
+
+            # Calculate size needed
+            canvas.update_idletasks()
+            test_id = canvas.create_text(0, 0, text=text, font=font)
+            bbox = canvas.bbox(test_id)
+            canvas.delete(test_id)
+
+            text_w = bbox[2] - bbox[0] + 60
+            text_h = bbox[3] - bbox[1] + 30
+
+            # Position at bottom center
+            x = (screen_w - text_w) // 2
+            y = screen_h - text_h - 120
+
+            self.root.geometry(f"{text_w}x{text_h}+{x}+{y}")
+            canvas.config(width=text_w, height=text_h)
+
+            cx, cy = text_w // 2, text_h // 2
+
+            # Draw outline (dark shadow in multiple directions)
+            for dx, dy in [(-2,-2), (-2,2), (2,-2), (2,2), (-2,0), (2,0), (0,-2), (0,2)]:
+                canvas.create_text(cx+dx, cy+dy, text=text, font=font, fill='#000000')
+
+            # Draw main text (white)
+            canvas.create_text(cx, cy, text=text, font=font, fill='#ffffff')
+
+            self.root.deiconify()  # Show
+            self.root.update()
+        except Exception as e:
+            print(f"[!] Overlay failed: {e}")
+            self.root = None
+
+    def hide(self):
+        try:
+            if self.root:
+                self.root.destroy()
+                self.root = None
+        except Exception:
+            pass
+
+def show_timed_overlay(text: str, duration: float = 3.0):
+    """Show an overlay with text for up to `duration` seconds, then hide it.
+    Runs in background thread so it doesn't block."""
+    def _show():
+        overlay = BlockingOverlay(text)
+        overlay.show()
+        time.sleep(duration)
+        overlay.hide()
+    threading.Thread(target=_show, daemon=True).start()
+
+class InputBlocker:
+    """Context manager to block input during critical automation steps."""
+    TIMEOUT_S = 10  # Failsafe: auto-unblock after this many seconds
+
+    def __init__(self):
+        self.blocked = False
+        self.overlay = None
+        self._released = threading.Event()
+        self._watchdog = None
+
+    def _watchdog_thread(self):
+        """Auto-unblock if timeout expires without normal release."""
+        if not self._released.wait(timeout=self.TIMEOUT_S):
+            # Timeout! Force unblock
+            print("[⚠️] FAILSAFE: Input blocked too long, forcing unblock!")
+            block_input(False)
+            if self.overlay:
+                try:
+                    self.overlay.hide()
+                except Exception:
+                    pass
+
+    def __enter__(self):
+        self._released.clear()
+
+        # Show overlay first
+        self.overlay = BlockingOverlay()
+        self.overlay.show()
+
+        # Start watchdog timer
+        self._watchdog = threading.Thread(target=self._watchdog_thread, daemon=True)
+        self._watchdog.start()
+
+        self.blocked = block_input(True)
+        if self.blocked:
+            print("[🔒] Input BLOCKED")
+        else:
+            print("[⚠️] Input blocking FAILED - not running as admin?")
+        return self
+
+    def __exit__(self, *args):
+        # Signal watchdog that we released normally
+        self._released.set()
+
+        block_input(False)
+        if self.blocked:
+            print("[🔓] Input UNBLOCKED")
+
+        # Hide overlay
+        if self.overlay:
+            self.overlay.hide()
 
 # -------- config --------
 CAPCUT_EXE = "capcut.exe"
@@ -38,7 +195,7 @@ def _confirm(msg: str) -> bool:
         pass
     return False
 WAIT_WINDOW_S = 5  # Window detection timeout
-SEARCH_TIMEOUT_S = 900
+SEARCH_TIMEOUT_S = 86400 * 7  # 1 week - effectively infinite, let it cook
 GRACE_S = 5  # filesystem time cushion
 
 DRAFT_ROOTS = [
@@ -46,18 +203,6 @@ DRAFT_ROOTS = [
     os.path.expandvars(r"%USERPROFILE%\Documents\CapCut\Projects\CapCut Drafts"),
 ]
 
-# Optional extra search dirs (e.g., motion blur cache)
-EXTRA_SEARCH_DIRS = [
-    os.path.expandvars(r"%LOCALAPPDATA%\CapCut\User Data\Cache\MotionBlurCache"),
-]
-_extra_env = os.environ.get("CAPCUT_EXTRA_SEARCH_DIRS", "")
-if _extra_env:
-    for _p in _extra_env.split(";"):
-        if _p.strip():
-            EXTRA_SEARCH_DIRS.append(os.path.expandvars(_p.strip()))
-_mb_env = os.environ.get("CAPCUT_MOTIONBLUR_CACHE", "")
-if _mb_env:
-    EXTRA_SEARCH_DIRS.append(os.path.expandvars(_mb_env))
 
 # -------- window helpers --------
 def focus_capcut_or_fail(timeout=WAIT_WINDOW_S):
@@ -275,24 +420,26 @@ def restart_capcut_and_focus():
 # -------- timeline ops --------
 def compound_and_save():
     _status("Compounding all clips…")
-    # Select everything
-    refocus_capcut_if_possible(); send_keys("^a"); time.sleep(0.5)
-    # Compound all into one: Alt+G
-    refocus_capcut_if_possible(); send_keys("%g"); time.sleep(1.0)
-    # Save
-    refocus_capcut_if_possible(); send_keys("^s"); time.sleep(0.5)
+    with InputBlocker():
+        # Select everything
+        refocus_capcut_if_possible(); send_keys("^a"); time.sleep(0.5)
+        # Compound all into one: Alt+G
+        refocus_capcut_if_possible(); send_keys("%g"); time.sleep(1.0)
+        # Save
+        refocus_capcut_if_possible(); send_keys("^s"); time.sleep(0.5)
 
 def trigger_preprocess_shortcut_and_mark(extra_settle_time: float = 0.0):
     _status("PRE-PROCESSING – PLEASE WAIT…")
-    # Select the compound clip first
-    refocus_capcut_if_possible(); time.sleep(0.5 + extra_settle_time)
-    send_keys("^a"); time.sleep(0.3 + extra_settle_time)
-    # Trigger pre-process
-    refocus_capcut_if_possible(); time.sleep(0.5 + extra_settle_time)
-    send_keys("^+{F11}")                      # Ctrl+Shift+F11 Pre-process shortcut
-    time.sleep(0.3 + extra_settle_time)
-    refocus_capcut_if_possible(); time.sleep(0.3 + extra_settle_time)
-    send_keys("^s")
+    with InputBlocker():
+        # Select the compound clip first
+        refocus_capcut_if_possible(); time.sleep(0.5 + extra_settle_time)
+        send_keys("^a"); time.sleep(0.3 + extra_settle_time)
+        # Trigger pre-process
+        refocus_capcut_if_possible(); time.sleep(0.5 + extra_settle_time)
+        send_keys("^+{F11}")                      # Ctrl+Shift+F11 Pre-process shortcut
+        time.sleep(0.3 + extra_settle_time)
+        refocus_capcut_if_possible(); time.sleep(0.3 + extra_settle_time)
+        send_keys("^s")
     return time.time()                   # timestamp AFTER sending the shortcut
 
 # -------- dialog helpers --------
@@ -365,34 +512,34 @@ def replace_clip_via_open_dialog(clip_path: Path, shortcut="^l", settle_s: float
     then pastes the absolute path into the OS file picker and presses Enter, finally saves.
     """
     focus_capcut_or_fail()
-    _status("Selecting clip…")
-    # Ensure the only clip is selected, then open Replace dialog
-    refocus_capcut_if_possible(); send_keys("^a")
-    time.sleep(0.15)
-    _status("Opening Replace dialog…")
-    refocus_capcut_if_possible(); send_keys(shortcut)
-
-    # Wait a bit longer for the dialog to fully appear
-    time.sleep(0.3)
-
-    # Prefer controlling the Open dialog directly to avoid send_keys escaping issues
     abs_path = str(clip_path)
-    time.sleep(0.5)  # Give dialog time to fully open
 
-    # Just use keyboard shortcuts - WAY more reliable
-    send_keys("%n")  # Alt+N jumps to "File name:" field
-    time.sleep(0.15)
-    send_keys("^a")  # Select all
-    time.sleep(0.1)
-    cb.copy(abs_path)
-    send_keys("^v")  # Paste
-    time.sleep(0.2)
-    send_keys("{ENTER}")  # Open file dialog
-    time.sleep(0.8)  # Wait for replace confirmation dialog
-    send_keys("{ENTER}")  # Confirm "Replace Clip"
-    time.sleep(0.8)  # Wait for replacement to complete
-    _status("Saving…")
-    send_keys("^s")
+    with InputBlocker():
+        _status("Selecting clip…")
+        # Ensure the only clip is selected, then open Replace dialog
+        refocus_capcut_if_possible(); send_keys("^a")
+        time.sleep(0.15)
+        _status("Opening Replace dialog…")
+        refocus_capcut_if_possible(); send_keys(shortcut)
+        time.sleep(0.3)
+
+        # Give dialog time to fully open
+        time.sleep(0.5)
+
+        # Just use keyboard shortcuts - WAY more reliable
+        send_keys("%n")  # Alt+N jumps to "File name:" field
+        time.sleep(0.15)
+        send_keys("^a")  # Select all
+        time.sleep(0.1)
+        cb.copy(abs_path)
+        send_keys("^v")  # Paste
+        time.sleep(0.2)
+        send_keys("{ENTER}")  # Open file dialog
+        time.sleep(0.8)  # Wait for replace confirmation dialog
+        send_keys("{ENTER}")  # Confirm "Replace Clip"
+        time.sleep(0.8)  # Wait for replacement to complete
+        _status("Saving…")
+        send_keys("^s")
     return
 
     # OLD CODE BELOW (kept as fallback)
@@ -535,9 +682,10 @@ def backup_active_draft():
 
     # Save project first
     print("[*] Saving project before backup...")
-    refocus_capcut_if_possible()
-    send_keys("^s")
-    time.sleep(1.0)
+    with InputBlocker():
+        refocus_capcut_if_possible()
+        send_keys("^s")
+        time.sleep(1.0)
 
     # Find ALL drafts across all locations with their modification times
     all_drafts = []
@@ -617,82 +765,36 @@ def restore_draft_from_backup(backup_list):
     print("[*] You can now reopen CapCut and continue editing.")
 
 # -------- file search / temp-to-final resolution --------
-def newest_nonalpha_mp4_since_anywhere(pre_ts: float, timeout_s: int = SEARCH_TIMEOUT_S, grace_s: int = GRACE_S) -> Path:
-    """
-    Search the ENTIRE drafts tree for the newest .mp4 whose mtime >= pre_ts - grace,
-    and whose filename does NOT end with 'alpha.mp4'. Returns the Path (may be a _temp.mp4).
-    """
-    normal_roots = list_all_draft_roots()
-    extra_roots: list[Path] = []
-    for extra in EXTRA_SEARCH_DIRS:
+def snapshot_existing_mp4s() -> dict[str, float]:
+    """Capture a baseline of all existing .mp4 files and their mtimes BEFORE triggering pre-process.
+    Returns dict mapping file path -> mtime."""
+    baseline = {}
+    for root in list_all_draft_roots():
         try:
-            p = Path(extra)
-            if p.exists():
-                extra_roots.append(p)
+            for p in root.rglob("*.mp4"):
+                try:
+                    baseline[str(p)] = p.stat().st_mtime
+                except OSError:
+                    pass
         except Exception:
             pass
-    # by default search both; after Motion Blur confirmation, restrict to extra only
-    restrict_to_extra = False
+    return baseline
+
+def newest_nonalpha_mp4_since_anywhere(pre_ts: float, timeout_s: int = SEARCH_TIMEOUT_S, grace_s: int = GRACE_S, baseline: dict[str, float] | None = None) -> Path:
+    """
+    Search the ENTIRE drafts tree for a NEW .mp4 file.
+    If baseline is provided, a file is considered "new" if:
+      - It doesn't exist in baseline (completely new file), OR
+      - Its mtime is newer than what was recorded in baseline
+    If no baseline, falls back to mtime >= pre_ts - grace.
+    Excludes files ending with 'alpha.mp4'. Returns the Path (may be a _temp.mp4).
+    """
     deadline = time.time() + timeout_s
     threshold = pre_ts - grace_s
     best_path, best_m = None, -1.0
 
-    warned_stuck = False
-    def _check_temp_progress_or_final(check_duration: float, threshold_ts: float):
-        """Wait check_duration seconds, then decide: (is_progress, final_path_or_None).
-        - If a final non-alpha mp4 appears after waiting, return (False, final_path)
-        - Else if newest temp file grew in size, return (True, None)
-        - Else return (False, None)
-        """
-        try:
-            scan_roots = (extra_roots if restrict_to_extra else (normal_roots + extra_roots))
-            # pick newest temp
-            newest_temp, newest_m = None, -1.0
-            for root in scan_roots:
-                for p in Path(root).rglob("*_temp.mp4"):
-                    try:
-                        m = p.stat().st_mtime
-                    except OSError:
-                        continue
-                    if m > newest_m:
-                        newest_temp, newest_m = p, m
-            s0 = None
-            if newest_temp is not None:
-                try:
-                    s0 = newest_temp.stat().st_size
-                except OSError:
-                    s0 = None
-            # wait
-            time.sleep(check_duration)
-            # re-scan for a final candidate that appeared meanwhile
-            best_path2, best_m2 = None, -1.0
-            for root in scan_roots:
-                for p in Path(root).rglob("*.mp4"):
-                    name = p.name.lower()
-                    if name.endswith("alpha.mp4"):
-                        continue
-                    try:
-                        m = p.stat().st_mtime
-                    except OSError:
-                        continue
-                    if m >= threshold_ts and m > best_m2:
-                        best_path2, best_m2 = p, m
-            if best_path2 is not None:
-                return (False, best_path2)
-            # otherwise, see if temp grew
-            if newest_temp is not None and s0 is not None:
-                try:
-                    s1 = newest_temp.stat().st_size
-                    if s1 > s0:
-                        return (True, None)
-                except OSError:
-                    pass
-            return (False, None)
-        except Exception:
-            return (False, None)
     while time.time() < deadline:
-        search_roots = (extra_roots if restrict_to_extra else (normal_roots + extra_roots))
-        for root in search_roots:
+        for root in list_all_draft_roots():
             for p in root.rglob("*.mp4"):
                 name = p.name.lower()
                 if name.endswith("alpha.mp4"):   # your explicit rule
@@ -701,44 +803,25 @@ def newest_nonalpha_mp4_since_anywhere(pre_ts: float, timeout_s: int = SEARCH_TI
                     m = p.stat().st_mtime
                 except OSError:
                     continue
-                if m >= threshold and m > best_m:
+                # Determine if this file is "new" (created/modified after we started)
+                file_path = str(p)
+                if baseline is not None:
+                    # File is new if it's not in baseline OR has newer mtime than baseline
+                    baseline_mtime = baseline.get(file_path)
+                    is_new = (baseline_mtime is None) or (m > baseline_mtime)
+                else:
+                    # Fallback: use timestamp threshold
+                    is_new = (m >= threshold)
+                if is_new and m > best_m:
                     best_path, best_m = p, m
         if best_path:
             _status(f"Found processed clip: {best_path}")
             return best_path
-        # After 120s with no output, check for temp activity; only warn if no temp growth is observed
-        if not warned_stuck and (time.time() - pre_ts) > 120:
-            warned_stuck = True
-            # If a normal temp file exists, assume in-progress without prompting
-            try:
-                has_normal_temp = any(True for r in normal_roots for _ in Path(r).rglob("*_temp.mp4"))
-            except Exception:
-                has_normal_temp = False
-            if has_normal_temp:
-                _status("Pre-processing in progress (temp file present)…")
-                time.sleep(1.0)
-                continue
-            in_progress, final_now = _check_temp_progress_or_final(10.0, threshold)
-            if final_now is not None:
-                _status(f"Found processed clip: {final_now}")
-                return final_now
-            if in_progress:
-                _status("Pre-processing in progress (temp file is growing)…")
-            else:
-                _status("Still waiting (>2m) and no temp file growth.")
-                if _confirm(
-                    "We noticed no Pre-processing activity. Does your compound clip show 'Waiting to preprocess'?\n\n"
-                    "This typically means the workflow is corrupted. The best workaround is to select the clip and apply a 1% Motion Blur.\n\n"
-                    "To continue with this solution simply select the clip, then select \"Video\" tab then \"Basic\" tab underneath that, scroll down to Motion blur, enable it, and set it to 1%. It will immediately begin applying the motion blur.\n\n"
-                    "Click Yes once you've applied Motion Blur, and the automation will continue."
-                ):
-                    _status("Motion Blur acknowledged. Monitoring MotionBlurCache for output…")
-                    restrict_to_extra = True
         time.sleep(0.4)
 
     raise TimeoutError("No post-Preprocess .mp4 found under drafts.")
 
-def resolve_temp_to_final(temp_or_final_path: Path, timeout_s: int = 600) -> Path:
+def resolve_temp_to_final(temp_or_final_path: Path, timeout_s: int = 86400) -> Path:
     """
     If the discovered file endswith '_temp.mp4', wait until the same name WITHOUT '_temp'
     appears in the same folder, then return that final path. Otherwise return the given path.
@@ -789,48 +872,67 @@ def main(do_backup=False):
     compound_and_save()
     print("[*] Compound created & saved.")
 
-    pre_ts = trigger_preprocess_shortcut_and_mark()
-    print("[*] Pre-process triggered. Searching drafts for newest non-alpha .mp4...")
+    # CRITICAL: Snapshot existing files BEFORE triggering pre-process
+    # This catches fast pre-processing on small projects that finish before we start looking
+    _status("Preparing baseline…")
+    print("[*] Snapshotting existing files (baseline)...")
+    baseline = snapshot_existing_mp4s()
+    print(f"[*] Baseline captured: {len(baseline)} existing .mp4 files")
 
-    # Check if temp file appears within 10 seconds, retry if not
+    pre_ts = trigger_preprocess_shortcut_and_mark()
+    print("[*] Pre-process triggered. Watching for NEW files...")
+
+    # Show pre-processing overlay for 3 seconds
+    show_timed_overlay("CapCut Bypass Pro - Pre-processing...", 3.0)
+
+    # Check if temp file OR final file appears within 10 seconds, retry if not
+    # Using baseline comparison to catch fast pre-processing
     max_retries = 2
     for retry in range(max_retries):
-        # Poll for temp file every 0.5s for up to 10 seconds
-        found_temp = False
+        # Poll for new files every 0.5s for up to 10 seconds
+        found_new = False
+        _status("Watching for output…")
         for check_iteration in range(20):  # 20 * 0.5s = 10 seconds
             time.sleep(0.5)
-            # Quick check for any temp file created after pre_ts in draft roots
+            # Check for any NEW .mp4 file (temp or final) not in baseline
             for root in list_all_draft_roots():
                 try:
-                    for temp_file in root.rglob("*_temp.mp4"):
+                    for mp4_file in root.rglob("*.mp4"):
                         try:
-                            if temp_file.stat().st_mtime >= pre_ts - 5:  # Within 5s grace period
-                                found_temp = True
+                            file_path = str(mp4_file)
+                            mtime = mp4_file.stat().st_mtime
+                            baseline_mtime = baseline.get(file_path)
+                            # File is new if not in baseline OR has newer mtime
+                            if baseline_mtime is None or mtime > baseline_mtime:
+                                found_new = True
+                                is_temp = mp4_file.name.lower().endswith("_temp.mp4")
+                                print(f"[✓] {'Temp' if is_temp else 'Final'} file detected after {(check_iteration + 1) * 0.5}s")
                                 break
                         except Exception:
                             pass
-                    if found_temp:
+                    if found_new:
                         break
                 except Exception:
                     pass
 
-            if found_temp:
-                print(f"[✓] Temp file detected after {(check_iteration + 1) * 0.5}s, pre-process is running")
+            if found_new:
                 break
 
-        if found_temp:
+        if found_new:
             break
 
         if retry < max_retries - 1:
-            print(f"[!] No temp file after 10s, retrying pre-process (attempt {retry + 2}/{max_retries})...")
+            print(f"[!] No new file after 10s, retrying pre-process (attempt {retry + 2}/{max_retries})...")
             _status(f"Retrying pre-process (attempt {retry + 2})…")
+            # Re-snapshot baseline before retry
+            baseline = snapshot_existing_mp4s()
             # Retry with extra settle time to let UI fully respond
             pre_ts = trigger_preprocess_shortcut_and_mark(extra_settle_time=0.5)
         else:
-            print(f"[!] No temp file after {max_retries} attempts, continuing search anyway...")
-            _status("No temp file detected, waiting for output…")
+            print(f"[!] No new file after {max_retries} attempts, continuing search anyway...")
+            _status("No new file detected, waiting for output…")
 
-    newest = newest_nonalpha_mp4_since_anywhere(pre_ts)
+    newest = newest_nonalpha_mp4_since_anywhere(pre_ts, baseline=baseline)
     print(f"[*] Candidate: {newest}")
 
     final_clip = resolve_temp_to_final(newest)
@@ -841,10 +943,14 @@ def main(do_backup=False):
     print("[✓] Clip replaced. Opening export dialog...")
 
     # Open export dialog
-    time.sleep(0.5)
-    refocus_capcut_if_possible()
-    send_keys("^e")
+    with InputBlocker():
+        time.sleep(0.5)
+        refocus_capcut_if_possible()
+        send_keys("^e")
     print("[✓] Export dialog opened. Configure settings and export.")
+
+    # Show done overlay
+    show_timed_overlay("CapCut Bypass Pro - Done! Export when ready.", 4.0)
 
     return backup_paths
 

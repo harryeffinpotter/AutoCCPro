@@ -1,9 +1,39 @@
-import os, sys, json, shutil, re
+import os, sys, json, shutil, re, ctypes
 import winsound
 import threading
 import tkinter as tk
 from tkinter import messagebox
 from pathlib import Path
+
+# -------- Auto-elevation --------
+def is_admin():
+    """Check if running with admin privileges."""
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except Exception:
+        return False
+
+def run_as_admin():
+    """Re-launch the current script with admin privileges."""
+    try:
+        if getattr(sys, 'frozen', False):
+            script = sys.executable
+            params = ' '.join(sys.argv[1:])
+        else:
+            script = sys.executable
+            params = f'"{sys.argv[0]}"'
+            if len(sys.argv) > 1:
+                params += ' ' + ' '.join(sys.argv[1:])
+        ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", script, params, None, 1)
+        return ret > 32
+    except Exception:
+        return False
+
+def ensure_admin():
+    """Ensure we're running as admin, re-launch if needed."""
+    if not is_admin():
+        if run_as_admin():
+            sys.exit(0)
 
 # Reuse your existing logic
 import capcut
@@ -471,5 +501,6 @@ def main():
 
 
 if __name__ == "__main__":
-	debug("Script started")
+	ensure_admin()
+	debug(f"Script started (Admin: {is_admin()})")
 	main()
